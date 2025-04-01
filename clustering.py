@@ -1,22 +1,90 @@
+import os
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
 import networkx as nx
 import math
+import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import PCA
+from datasets import load_dataset
+import requests
+import zipfile
 
-# Config
+# --- Config ---
 BLOCK_SIZE = 10000
 K = 3
 MERGE_THRESHOLD = 0.85
+GLOVE_DIM = 300
+GLOVE_ZIP_URL = "http://nlp.stanford.edu/data/glove.6B.zip"
+GLOVE_FILENAME = "glove.6B.300d.txt"
+GLOVE_DIR = "glove_data"
+GLOVE_PATH = os.path.join(GLOVE_DIR, GLOVE_FILENAME)
 
-# Step 1: Chunking dataset
+# --- Download GloVe if not present ---
+def ensure_glove():
+    if not os.path.exists(GLOVE_PATH):
+        os.makedirs(GLOVE_DIR, exist_ok=True)
+        zip_path = os.path.join(GLOVE_DIR, "glove.6B.zip")
+        print("Downloading GloVe embeddings...")
+        r = requests.get(GLOVE_ZIP_URL, stream=True)
+        with open(zip_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print("Extracting GloVe...")
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extract(GLOVE_FILENAME, GLOVE_DIR)
+        os.remove(zip_path)
+
+# --- Load GloVe Vectors ---
+def load_glove(path):
+    word_vecs = {}
+    with open(path, 'r', encoding='utf8') as f:
+        for line in f:
+            parts = line.strip().split()
+            word = parts[0]
+            vec = np.array(parts[1:], dtype=float)
+            word_vecs[word] = vec
+    return word_vecs
+
+ensure_glove()
+glove_vectors = load_glove(GLOVE_PATH)
+
+# --- TF-IDF Weighted Sentence Embeddings ---
+def compute_weighted_embeddings(texts, word_vecs, dim=300):
+    vectorizer = TfidfVectorizer()
+    tfidf = vectorizer.fit_transform(texts)
+    vocab = vectorizer.vocabulary_
+    idf = vectorizer.idf_
+    idf_dict = {word: idf[i] for word, i in vocab.items()}
+
+    embeddings = []
+    for text in texts:
+        words = text.lower().split()
+        vecs = []
+        weights = []
+        for word in words:
+            if word in word_vecs and word in idf_dict:
+                vecs.append(word_vecs[word])
+                weights.append(idf_dict[word])
+        if vecs:
+            weighted = np.average(vecs, axis=0, weights=weights)
+        else:
+            weighted = np.zeros(dim)
+        embeddings.append(weighted)
+    return np.array(embeddings)
+
+# --- PCA Dimensionality Reduction ---
+def reduce_embeddings(embeddings, out_dim=100):
+    pca = PCA(n_components=out_dim)
+    return pca.fit_transform(embeddings)
+
+# --- Chunking ---
 def chunked(iterable, size):
     for i in range(0, len(iterable), size):
         yield iterable[i:i + size]
 
-# Step 2: Local processing
-def local_block_clustering(text_block, model):
-    embeddings = model.encode(text_block, convert_to_numpy=True)
+# --- Local Clustering ---
+def local_block_clustering(text_block, embeddings):
     sims = cosine_similarity(embeddings)
     sparse_edges = []
     for i in range(len(text_block)):
@@ -46,9 +114,9 @@ def local_block_clustering(text_block, model):
             unvisited.discard(next_node)
         else:
             clusters.append({current})
-    return clusters, embeddings
+    return clusters
 
-# Step 3: Compute centroids of local clusters
+# --- Compute Centroids ---
 def compute_centroids(clusters, embeddings, offset=0):
     centroids = []
     mapping = []
@@ -60,7 +128,7 @@ def compute_centroids(clusters, embeddings, offset=0):
         mapping.append([i + offset for i in idxs])
     return centroids, mapping
 
-# Step 4: Merge clusters across blocks
+# --- Merge Clusters Across Blocks ---
 def merge_cross_block_clusters(all_centroids, all_mappings, threshold):
     sims = cosine_similarity(all_centroids)
     merged = []
@@ -79,41 +147,23 @@ def merge_cross_block_clusters(all_centroids, all_mappings, threshold):
         used.add(i)
     return merged
 
-# ---- Main Pipeline ----
+# --- Main TeraHAC Pipeline ---
 def teraHAC_clustering(texts):
-    model = SentenceTransformer('all-mpnet-base-v2')
+    embeddings = compute_weighted_embeddings(texts, glove_vectors)
+    reduced_embeddings = reduce_embeddings(embeddings, out_dim=100)
 
     all_centroids = []
     all_mappings = []
     offset = 0
 
-    for block in chunked(texts, BLOCK_SIZE):
-        clusters, embeddings = local_block_clustering(block, model)
-        centroids, mapping = compute_centroids(clusters, embeddings, offset=offset)
+    for block in chunked(list(zip(texts, reduced_embeddings)), BLOCK_SIZE):
+        block_texts = [b[0] for b in block]
+        block_embeds = np.array([b[1] for b in block])
+        clusters = local_block_clustering(block_texts, block_embeds)
+        centroids, mapping = compute_centroids(clusters, block_embeds, offset=offset)
         all_centroids.extend(centroids)
         all_mappings.extend(mapping)
         offset += len(block)
 
     final_clusters = merge_cross_block_clusters(all_centroids, all_mappings, MERGE_THRESHOLD)
     return final_clusters
-
-
-from datasets import load_dataset
-
-# Load the English split of the STS Benchmark (Semantic Textual Similarity)
-dataset = load_dataset("stsb_multi_mt", name="en", split="train")
-
-# Extract 1000 non-empty sentence1 entries
-texts = [ex["sentence1"] for ex in dataset if ex["sentence1"]][:1000]
-
-clusters = teraHAC_clustering(texts)
-
-
-res = []
-for i, cluster in enumerate(clusters):
-    #print(f"Final Cluster {i+1}: {[texts[n] for n in cluster]}")
-    res.append((len(cluster), [texts[n] for n in cluster]))
-    
-df = pd.DataFrame(res, columns=["size","sentences"])
-
-df.to_excel("sentences_1000.xlsx", index=False)
